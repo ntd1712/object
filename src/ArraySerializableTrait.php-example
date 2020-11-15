@@ -1,0 +1,474 @@
+<?php
+
+namespace Chaos\Support\Object;
+
+use Chaos\Support\Object\CollectionInterface;
+use Chaos\Support\Object\ModelInterface;
+use Chaos\Support\Doctrine\Type\Type;
+use Doctrine\Common\Collections\Collection;
+
+define('CHAOS_EXCLUDE_ANNOTATION', 'Annotation\Exclude');
+define('CHAOS_EXCLUDE_DATA', '@ignore');
+define('CHAOS_MAX_RECURSION_DEPTH', 14);
+define('CHAOS_PATTERN_OPERATOR_SEPARATOR', '#\s*(?:and|or)\s*#i');
+define(
+    'CHAOS_PATTERN_COLUMN',
+    '#column\(.*(?:type\s*=\s*["\']([^"\'\s]+)["\']|' .
+    'columndefinition\s*=\s*["\']([^\s\(]+)(?:\([^\)]+\))?[\w\s]*["\']).*\)#i'
+);
+define('CHAOS_PATTERN_ONE_MANY', '#((?:one|many)to(?:one|many))\(.*targetentity\s*=\s*["\']\\\?([^"\'\s]+)["\'].*\)#i');
+define(
+    'CHAOS_PATTERN_TYPE',
+    '#type\("\\\?([\w\\\]+)(?:<\'?\\\?([^\',]+)\'?(?:\s*,\s*\'?\\\?([^\',]+)\'?)?(?:\s*,\s*\'?\\\?([^\',]+)\'?)?>)?"\)#'
+);
+define('CHAOS_PATTERN_VAR', '#@var\s+\\\?([\w\\\]+)(?:[(\[<]\\\?([\w\\\]*)[>\])])?#i');
+
+/**
+ * Trait ArraySerializableTrait.
+ *
+ * @author t(-.-t) <ntd1712@mail.com>
+ */
+trait ArraySerializableTrait
+{
+    /**
+     * Copies own properties in the source object over to the current object.
+     *
+     * @param object $source The source object.
+     *
+     * @return $this
+     */
+    public function extend($source)
+    {
+        foreach ($this as $property => $value) {
+            if (property_exists($source, $property)) {
+                $this->{$property} = $source->{$property};
+            }
+        }
+
+        return $this;
+    }
+
+    /**
+     * {@inheritDoc}
+     *
+     * @param array $array An array of key/value pairs to exchange.
+     * @param int $depth The depth that we go into; defaults to -1.
+     * @param array $visited An array of visited objects; used to prevent cycling.
+     *
+     * @return $this
+     */
+    public function exchangeArray(array $array, $depth = -1, &$visited = [])
+    {
+        if (empty($array) || CHAOS_MAX_RECURSION_DEPTH < ++$depth) {
+            return $this;
+        }
+
+        // $visited[get_called_class()] = ['object' => &$this, 'depth' => $depth];
+        try {
+            $properties = (new \ReflectionClass($this))
+                ->getProperties();
+        } catch (\ReflectionException $e) {
+            return $this;
+        }
+
+        foreach ($properties as $property) {
+            if ($property->isStatic()
+                || false !== strpos($docComment = $property->getDocComment(), CHAOS_EXCLUDE_ANNOTATION)
+            ) {
+                unset($array[$property->name]);
+                continue;
+            }
+
+            // check if given name exists in $array or not; to parse such values like 'now', applied to `0 === $depth`
+            if (!array_key_exists($property->name, $array)) {
+                if (empty($depth)) {
+                    $property->setAccessible(true);
+                    $array[$property->name] = $property->getValue($this);
+                } else {
+                    continue;
+                }
+            } else {
+                $property->setAccessible(true);
+            }
+
+            $value = $array[$property->name];
+            $types = $this->parseProperty($property);
+
+            if ($types['is_scalar']) {
+                if ($types['is_collection']) {
+                    $value = Type::getType(Type::SIMPLE_ARRAY_TYPE)
+                        ->convertToPHPValue($value);
+                    $type0 = Type::getType(strtolower($types[0]));
+
+                    foreach ($value as &$v) {
+                        $v = $type0->convertToPHPValue($v);
+                    }
+                    unset($v);
+                } else {
+                    $value = Type::getType(strtolower($types[0]))
+                        ->convertToPHPValue($value);
+                }
+
+                // TODO: do we have any defined filters & validators?
+                // if (false === strpos($docComment, CHAOS_ANNOTATION_IGNORE_RULES)) {
+                //     $this->addRules($property);
+                // }
+        //  } else if (isset($visited[$types[0]]) && $visited[$types[0]]['depth'] !== $depth) { // check cyclic refs
+                // if ($types['is_collection']) {
+                //     $value = $this->addOrAppend($visited[$types[0]]['object'], $types[1]);
+                // } else {
+                //     $value = $visited[$types[0]]['object'];
+                // }
+            } else if (is_array($value) && class_exists($types[0])) {
+                /**
+                 * @var \Traversable|self[]|self $obj
+                 * @var self $item
+                 */
+                $obj = $types['is_collection'] ? $types[1] : null;
+
+                if (!empty($value) && false === strpos($docComment, CHAOS_EXCLUDE_DATA)) {
+                    if (is_subclass_of($types[0], ModelInterface::class)) {
+                        if ($types['is_collection']) {
+                            $method = method_exists($obj, 'add') ? 'add' : 'append';
+                            $isMulti = is_array($value[$firstKey = key($value)]) || is_object($value[$firstKey]);
+
+                            if (!$isMulti) {
+                                $value = [$value];
+                            }
+
+                            if (0 === iterator_count($obj)) {
+                                foreach ($value as $v) {
+                                    $item = new $types[0];
+                                    is_object($v)
+                                        ? $item->extend($v)
+                                        : $item->exchangeArray($v, $depth, $visited);
+                                    $this->addOrAppend($item, $obj, $method);
+                                }
+                            } else {
+                                // TODO: check 'm
+                                $identifier = array_flip($this->getEntityIdentifier());
+                                $temp = [];
+
+                                foreach ($obj as $k => $v) {
+                                    if (is_object($v)) {
+                                        if ($v instanceof ModelInterface) {
+                                            $v = $v->toArray();
+                                        } else {
+                                            $v = get_object_vars($v);
+                                        }
+                                    }
+
+                                    if ($v = array_intersect_key($v, $identifier)) {
+                                        $temp[$k] = $v;
+                                    }
+                                }
+
+                                foreach ($value as $v) {
+                                    if (is_object($v)) {
+                                        $v = get_object_vars($v);
+                                    }
+
+                                    if (($v = array_intersect_key($v, $identifier))
+                                        && false !== ($k = array_search($v, $temp))
+                                    ) {
+                                        if ($obj[$k] instanceof self) {
+                                            $obj[$k]->exchangeArray($v, $depth, $visited);
+                                        } else {
+                                            foreach ($obj[$k] as $key => $val) {
+                                                if (array_key_exists($key, $v)) {
+                                                    $obj[$k]->{$key} = $v[$key];
+                                                }
+                                            }
+                                        }
+                                    } else {
+                                        $item = new $types[0];
+                                        $item->exchangeArray($v, $depth, $visited);
+                                        $this->addOrAppend($item, $obj, $method);
+                                    }
+                                }
+                            }
+                        } else {
+                            $obj = new $types[0];
+                            $obj->exchangeArray($value, $depth, $visited);
+                        }
+                    } else {
+                        try {
+                            if ($types['is_collection']) {
+                                $item = new $types[0]($value);
+                                $this->addOrAppend($item, $obj);
+                            } else {
+                                $obj = new $types[0]($value);
+                            }
+                        } catch (\Exception $e) {
+                            //
+                        }
+                    }
+                }
+
+                $value = $obj;
+            }
+
+            $property->setValue($this, $value); // set our new value (if any)
+            unset($array[$property->name]);     // for next loop
+        }
+
+        return $this;
+    }
+
+    /**
+     * {@inheritDoc}
+     *
+     * @return array
+     */
+    public function getArrayCopy()
+    {
+        $visited[spl_object_hash($this)] = $visited[static::class] = true;
+        $array = get_object_vars($this);
+
+        foreach ($array as &$value) {
+            $value = $this->convertToArray($value, 0, $visited); // e.g. User: depth 0 > UserRole: 1 > User: 2
+        }
+        unset($value);
+
+        return $array;
+    }
+
+    /**
+     * {@inheritDoc}
+     *
+     * @return array
+     */
+    public function toArray()
+    {
+        return $this->getArrayCopy();
+    }
+
+    // <editor-fold desc="Private methods" defaultstate="collapsed">
+
+    /**
+     * @tutorial Breadth-first search
+     *
+     * @param mixed $var The value to convert.
+     * @param int $depth The depth that we go into; defaults to 0.
+     * @param array $visited An array of visited objects; used to prevent cycling.
+     *
+     * @return mixed
+     */
+    private function convertToArray($var, $depth = 0, &$visited = [])
+    {
+        if (empty($var)) {
+            return $var;
+        }
+
+        if (is_object($var)) {
+            if ($var instanceof \DateTime) {
+                return $var->format(DATE_ATOM); // to compatible with JavaScript's Date's constructor
+            }
+
+            $hash = spl_object_hash($var);
+
+            if (isset($visited[$hash])) {
+                return '*RECURSION(' . str_replace('\\', '\\\\', get_class($var)) . '#' . $depth . ')*';
+            }
+
+            $visited[$hash] = $visited[get_class($var)] = true;
+
+            if ($var instanceof \Traversable) {
+                if (method_exists($var, 'getMapping')) {
+                    /* @var \Doctrine\ORM\PersistentCollection $var */
+                    if (null !== ($mapping = $var->getMapping())
+                        && isset($visited[$mapping['targetEntity']]) && 4 === $mapping['type'] // one-to-many relation
+                    ) {
+                        return '*COLLECTION*';
+                    }
+                }
+
+                if ($var instanceof \ArrayObject || $var instanceof \ArrayIterator) {
+                    $array = $var->getArrayCopy();
+                } else if (method_exists($var, 'toArray')) {
+                    $array = $var->toArray();
+                } else {
+                    $array = iterator_to_array($var);
+                }
+            } else {
+                if ($var instanceof ModelInterface) {
+                    $array = $var->toArray();
+                } else {
+                    $array = get_object_vars($var);
+                }
+
+                /* @see \Doctrine\Common\Proxy\Proxy */
+                unset($array['__initializer__'], $array['__cloner__'], $array['__isInitialized__']);
+            }
+
+            if (empty($array)) {
+                return $array;
+            }
+
+            $var = $array;
+        }
+
+        if (is_array($var)) {
+            if (CHAOS_MAX_RECURSION_DEPTH < ++$depth) {
+                return '*MAX_RECURSION_DEPTH_EXCEEDED*';
+            }
+
+            return array_map(
+                function ($value) use ($depth, $visited) {
+                    return $this->convertToArray($value, $depth, $visited);
+                },
+                $var
+            );
+        }
+
+        // e.g. scalar, resource, closure
+        return $var;
+    }
+
+    /**
+     * Parses a property.
+     *
+     * @param \ReflectionProperty $property The property.
+     *
+     * @return array
+     */
+    private function parseProperty(\ReflectionProperty $property)
+    {
+        if (method_exists($this, $getter = 'get' . $property->name . 'DataType')) { // check if getXyzDataType() exists
+            $types = @call_user_func([$this, $getter]);
+
+            if (!is_array($types)) {
+                $types = [$types];
+            }
+        } else {
+            $docComment = $property->getDocComment();
+
+            if (false !== strpos($docComment, '@var')) {
+                // e.g. @var \T        : return ['T']
+                //      @var \T[]      : return ['T', '']
+                //      @var array<\T> : return ['array', 'T']
+                //      @var \Array\Collection<\T> : return ['Array\Collection', 'T']
+                preg_match(CHAOS_PATTERN_VAR, $docComment, $types);
+            } else if (false !== strpos($docComment, 'targetEntity')) {
+                // e.g. @OneToMany(targetEntity="\T") : return [OneToMany, 'T'] -> [ArrayCollection::class, 'T']
+                preg_match(CHAOS_PATTERN_ONE_MANY, $docComment, $types);
+
+                if (isset($types[2]) && isset($types[1])) {
+                    if ('OneToMany' === $types[1] || 'ManyToMany' === $types[1]) {
+                        $types[1] = CollectionInterface::class;
+                    }
+                }
+            } else if (false !== strpos($docComment, 'Column')
+                || false !== stripos($docComment, 'column')
+            ) {
+                // e.g. @Column(columnDefinition="CHAR(2) NOT NULL", type="string") : return ['string']
+                //      @Column(type="string", columnDefinition="ENUM('visible', 'invisible')") : return ['ENUM']
+                preg_match(CHAOS_PATTERN_COLUMN, $docComment, $types);
+            } else if (false !== strpos($docComment, '@Type')
+                || false !== strpos($docComment, 'JMS\Serializer\Annotation\Type')
+            ) {
+                // e.g. @Type("\T")                       : return ['T']
+                //      @Type("array<\T>")                : return ['array', 'T']
+                //      @Type("array<\K, \V>")            : return ['array', 'K', 'V']
+                //      @Type("\Array\Collection")        : return ['Array\Collection']
+                //      @Type("\Array\Collection<\T>")    : return ['Array\Collection', 'T']
+                //      @Type("\Array\Collection<\K, \V>"): return ['Array\Collection', 'K', 'V']
+                //      @Type("DateTime<'Y-m-d'>")        : return ['DateTime', 'Y-m-d']
+                //      @Type("DateTime<'Y-m-d', 'UTC'>") : return ['DateTime', 'Y-m-d H:i:sP (e)', 'America/New_York']
+                //      @Type("DateTime<'Y-m-d H:i:sP (e)', 'America/New_York', 'Y/m.d\TH:i:s.u'>")
+                //          : return ['DateTime', 'Y-m-d H:i:sP (e)', 'America/New_York', 'Y/m.d\TH:i:s.u']
+                preg_match(CHAOS_PATTERN_TYPE, $docComment, $types);
+            }
+
+            if (!empty($types)) { // HACK: using IF to run faster, so weird
+                array_shift($types);
+            }
+        }
+
+        if (empty($types)) {
+            return [
+                gettype($property->getValue($this)),
+                'is_scalar' => true,
+                'is_collection' => false
+            ];
+        }
+
+        // parse `types[1]` if any
+        $scalars = Type::getTypesMap();
+        $types['is_collection'] = isset($types[1]);
+
+        if ($types['is_collection']) {
+            $value = $property->getValue($this);
+            $isEmpty = empty($types[1]); // e.g. ['T', '']
+
+            if (!$isEmpty) {
+                $types = array_reverse($types); // e.g. ['Array\Collection', 'T'] -> ['T', 'Array\Collection']
+            }
+
+            if (isset($value)) { // if instanced, then override it
+                $types[1] = $value;
+            } else {
+                if ($isEmpty) {
+                    $types[1] = Type::ARRAY_TYPE; // e.g. ['T', ''] -> ['T', 'array']
+                } else if (!isset($scalars[strtolower($types[1])])) {
+                    if (false === strpos($types[1], '\\')) {
+                        $types[1] = guessNamespace($types[1], $property->getDeclaringClass()->getNamespaceName());
+                    }
+
+                    if (is_subclass_of($types[1], Collection::class)) {
+                        $types[1] = new $types[1];
+                    } else if (class_exists($types[1], false)) {
+                        try {
+                            $types[1] = (new \ReflectionClass($types[1]))
+                                ->newInstanceWithoutConstructor();
+                        } catch (\ReflectionException $e) {
+                            $types[1] = null;
+                        }
+                    }
+                }
+            }
+
+            // only array and array-type object are allowed
+            if (!($types[1] instanceof \Traversable || Type::ARRAY_TYPE === $types[1])) {
+                unset($types[1]);
+                $types['is_collection'] = false;
+            }
+        }
+
+        // parse `types[0]` if any
+        $types['is_scalar'] = isset($scalars[strtolower($types[0])]);
+
+        if (!$types['is_scalar']) {
+            if (false === strpos($types[0], '\\')) {
+                $types[0] = guessNamespace($types[0], $property->getDeclaringClass()->getNamespaceName());
+            }
+
+            if ($types['is_collection'] && Type::ARRAY_TYPE === $types[1]) {
+                $collection = CollectionInterface::class;
+                $types[1] = new $collection;
+            }
+        }
+
+        return $types;
+    }
+
+    /**
+     * @param mixed $var The element.
+     * @param \Traversable $collection The collection.
+     * @param null|string $method The known method name.
+     *
+     * @return \Traversable
+     */
+    private function addOrAppend($var, \Traversable $collection, $method = null)
+    {
+        if (null === $method) {
+            $method = method_exists($collection, 'add') ? 'add' : 'append';
+        }
+
+        call_user_func([$collection, $method], $var);
+
+        return $collection;
+    }
+
+    // </editor-fold>
+}
