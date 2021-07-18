@@ -1,0 +1,29 @@
+{
+  "name": "chaos/object",
+  "description": "Collections of base classes and interfaces",
+  "keywords": [
+    "vietnam",
+    "collection",
+    "model",
+    "object"
+  ],
+  "homepage": "https://github.com/ntd1712",
+  "license": "MIT",
+  "authors": [
+    {
+      "name": "ntd1712",
+      "email": "ntd1712@mail.com"
+    }
+  ],
+  "require": {},
+  "autoload": {
+    "psr-4": {
+      "Chaos\\Support\\Object\\": "src/"
+    }
+  },
+  "autoload-dev": {
+    "psr-4": {
+      "Tests\\": "tests/"
+    }
+  }
+}
